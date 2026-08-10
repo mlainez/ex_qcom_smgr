@@ -21,7 +21,7 @@ defmodule ExQcomSmgr.MixProject do
   defp deps do
     [
       # ADSP needs to be running before qcom-smgr IIO devices exist.
-      {:ex_remoteproc, path: "../ex_remoteproc"}
+      {:ex_remoteproc, github: "mlainez/ex_remoteproc"}
     ]
   end
 end
