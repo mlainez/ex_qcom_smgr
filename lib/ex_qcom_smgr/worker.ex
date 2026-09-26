@@ -1,136 +1,193 @@
 defmodule ExQcomSmgr.Worker do
   @moduledoc """
-  Per-sensor state holder.
+  Per-sensor worker: caches the latest sample and supervises its reader.
 
-  Two linked processes per sensor:
+  Two processes per sensor:
 
-    1. **The Worker GenServer** owns the cache (last sample seen) and
-       answers `read/1` by handing back what's in cache — never blocks
-       on the IIO chardev.
-    2. **The reader process** (spawn_link'd by the Worker) owns the
-       `/dev/iio:deviceN` fd. It loops on `:file.read/2`, parses each
-       sample, and sends it to the Worker via a message.
+    1. **The worker GenServer** (registered as `ExQcomSmgr.Worker.<type>`)
+       holds the last sample seen and answers `read/1` from that cache.
+       It never touches the IIO chardev, so `read/1` returns immediately.
+    2. **The reader process** (registered as
+       `ExQcomSmgr.Worker.<type>.reader`) is started with `spawn_monitor/1`
+       — monitored, not linked. It configures the IIO buffer, opens
+       `/dev/iio:deviceN`, loops on a blocking read, and sends each parsed
+       sample to the worker.
 
-  Splitting the fd owner from the cache holder means the chardev can
-  block forever (as it does for the prox sensor when no state-change
-  events arrive) without affecting `read/1` latency or stalling other
-  callers.
+  When the reader exits for any reason (device missing, open failure,
+  EOF, read error), the worker gets a `:DOWN` message, logs it, writes
+  `0` to the device's `buffer/enable`, and starts a new reader after an
+  exponential backoff (`:retry_min_ms` doubling up to `:retry_max_ms`,
+  reset whenever a sample arrives). The same backoff applies while the
+  IIO device hasn't appeared yet. The worker itself does not crash, so a
+  missing or broken sensor can't restart-storm the application.
 
-  If the reader process dies, the Worker's `:DOWN` handler logs it and
-  starts a new reader after a short backoff. The Worker survives.
+  ## Blocking reads
+
+  The chardev is opened as a raw file, so each blocking read occupies an
+  Erlang dirty I/O scheduler thread until data arrives. Proximity may
+  not report anything for a long time, so its reader can hold one such
+  thread indefinitely. To keep this bounded there is at most one reader
+  per sensor (enforced by the registered name): if a worker restarts
+  while its old reader is still blocked, the new worker adopts that
+  reader instead of starting a second one, and the reader delivers its
+  samples to whichever worker is currently registered. A blocked reader
+  can't be interrupted from Erlang; if no worker is registered when a
+  read completes, the reader exits and closes the device.
   """
   use GenServer
   require Logger
 
+  @doc false
   def name(type), do: :"#{__MODULE__}.#{type}"
 
+  @doc false
+  def reader_name(type), do: :"#{__MODULE__}.#{type}.reader"
+
+  @doc "Starts the worker for `type` (one of `ExQcomSmgr.types/0`)."
+  @spec start_link(ExQcomSmgr.sensor_type()) :: GenServer.on_start()
   def start_link(type) do
     GenServer.start_link(__MODULE__, type, name: name(type))
   end
 
   @doc """
-  Returns the most recent sample. Non-blocking — completes in
-  microseconds. Returns `{:error, :no_data}` if no sample has been
-  received yet (typical right after boot, or for prox before the
-  first state-change event).
+  Returns the most recent sample for `type` without blocking on the
+  device. See `ExQcomSmgr.read/1` for the return values.
   """
-  def read(type), do: GenServer.call(name(type), :read, 1_000)
+  @spec read(ExQcomSmgr.sensor_type()) :: {:ok, ExQcomSmgr.reading()} | {:error, term()}
+  def read(type) do
+    GenServer.call(name(type), :read, 1_000)
+  catch
+    :exit, {:timeout, _} -> {:error, :timeout}
+    :exit, _ -> {:error, :not_running}
+  end
 
-  @impl true
+  @impl GenServer
   def init(type) do
-    state = %{type: type, latest: nil, reader_ref: nil}
+    state = %{type: type, latest: nil, reader: nil, ref: nil, sysfs: nil, failures: 0}
     {:ok, state, {:continue, :start_reader}}
   end
 
-  @impl true
-  def handle_continue(:start_reader, state) do
-    case ExQcomSmgr.device_path(state.type) do
-      {:ok, sysfs} ->
-        pid = start_reader(self(), sysfs, state.type)
-        Logger.info("ex_qcom_smgr: reader for #{state.type} started")
-        {:noreply, %{state | reader_ref: Process.monitor(pid)}}
+  @impl GenServer
+  def handle_continue(:start_reader, state), do: {:noreply, start_reader(state)}
 
-      :error ->
-        # ADSP / qcom-smgr not up yet — retry shortly.
-        Process.send_after(self(), :retry, 1_000)
-        {:noreply, state}
+  @impl GenServer
+  def handle_info(:retry, %{reader: nil} = state), do: {:noreply, start_reader(state)}
+  def handle_info(:retry, state), do: {:noreply, state}
+
+  def handle_info({:sample, sample}, state) do
+    {:noreply, %{state | latest: sample, failures: 0}}
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, reason}, %{ref: ref} = state) do
+    Logger.warning("ex_qcom_smgr: #{state.type} reader exited: #{inspect(reason)}")
+
+    # Don't touch the buffer if another reader already owns it.
+    if reason != :reader_already_running, do: disable_buffer(state.sysfs)
+    {:noreply, schedule_retry(%{state | reader: nil, ref: nil})}
+  end
+
+  def handle_info(_msg, state), do: {:noreply, state}
+
+  @impl GenServer
+  def handle_call(:read, _from, %{latest: nil} = state), do: {:reply, {:error, :no_data}, state}
+  def handle_call(:read, _from, state), do: {:reply, {:ok, state.latest}, state}
+
+  defp start_reader(%{type: type} = state) do
+    sysfs =
+      case ExQcomSmgr.device_path(type) do
+        {:ok, path} -> path
+        :error -> nil
+      end
+
+    case {Process.whereis(reader_name(type)), sysfs} do
+      {pid, _} when is_pid(pid) ->
+        Logger.info("ex_qcom_smgr: adopting existing #{type} reader")
+        %{state | reader: pid, ref: Process.monitor(pid), sysfs: sysfs}
+
+      {nil, nil} ->
+        if state.failures == 0 do
+          Logger.info("ex_qcom_smgr: #{type} IIO device not present yet, will retry")
+        end
+
+        schedule_retry(state)
+
+      {nil, sysfs} ->
+        {pid, ref} = spawn_monitor(fn -> reader_init(type, sysfs) end)
+        Logger.info("ex_qcom_smgr: #{type} reader started on #{sysfs}")
+        %{state | reader: pid, ref: ref, sysfs: sysfs}
     end
   end
 
-  @impl true
-  def handle_info(:retry, state), do: handle_continue(:start_reader, state)
-
-  def handle_info({:sample, sample}, state) do
-    {:noreply, %{state | latest: sample}}
+  defp schedule_retry(state) do
+    Process.send_after(self(), :retry, backoff(state.failures))
+    %{state | failures: state.failures + 1}
   end
 
-  def handle_info({:DOWN, ref, :process, _, reason}, %{reader_ref: ref} = state) do
-    Logger.warning("ex_qcom_smgr: reader #{state.type} died: #{inspect(reason)}")
-    Process.send_after(self(), :retry, 1_000)
-    {:noreply, %{state | reader_ref: nil}}
+  @doc false
+  @spec backoff(non_neg_integer()) :: pos_integer()
+  def backoff(failures) do
+    min_ms = Application.get_env(:ex_qcom_smgr, :retry_min_ms, 1_000)
+    max_ms = Application.get_env(:ex_qcom_smgr, :retry_max_ms, 30_000)
+    min(max_ms, min_ms * Integer.pow(2, min(failures, 16)))
   end
 
-  def handle_info(_, state), do: {:noreply, state}
+  # ---- reader process (owns the fd; blocking read loop) ----
 
-  @impl true
-  def handle_call(:read, _from, %{latest: nil} = state) do
-    {:reply, {:error, :no_data}, state}
-  end
+  defp reader_init(type, sysfs) do
+    try do
+      Process.register(self(), reader_name(type))
+    rescue
+      ArgumentError -> exit(:reader_already_running)
+    end
 
-  def handle_call(:read, _from, state) do
-    {:reply, {:ok, state.latest}, state}
-  end
+    spec = ExQcomSmgr.spec(type)
 
-  # ---- reader process (owns the fd; runs :file.read in a loop) ----
-
-  defp start_reader(parent, sysfs, type) do
-    spawn_link(fn -> reader_init(parent, sysfs, type) end)
-  end
-
-  defp reader_init(parent, sysfs, type) do
     with :ok <- enable_buffer(sysfs, type),
-         {:ok, scale} <- read_scale(sysfs, type),
-         {:ok, fd} <- open_chardev(sysfs) do
-      spec = ExQcomSmgr.spec(type)
+         {:ok, fd} <- :file.open(ExQcomSmgr.chardev_path(sysfs), [:read, :raw, :binary]) do
+      scale = ExQcomSmgr.read_scale(sysfs, type)
 
       try do
-        reader_loop(parent, fd, spec, scale)
+        reader_loop(type, fd, spec, scale)
       after
         :file.close(fd)
       end
     else
-      err ->
-        Logger.warning("ex_qcom_smgr: reader #{type} init failed: #{inspect(err)}")
-        exit({:open_failed, err})
+      err -> exit({:open_failed, err})
     end
   end
 
-  defp reader_loop(parent, fd, spec, scale) do
+  defp reader_loop(type, fd, spec, scale) do
     case :file.read(fd, spec.frame_size) do
       {:ok, data} when byte_size(data) == spec.frame_size ->
-        sample = ExQcomSmgr.parse_sample(data, spec, scale)
-        send(parent, {:sample, sample})
-        reader_loop(parent, fd, spec, scale)
+        deliver(type, {:sample, ExQcomSmgr.parse_sample(data, spec, scale)})
+        reader_loop(type, fd, spec, scale)
+
+      {:ok, _short} ->
+        # Frame-size mismatch: back off briefly and keep reading.
+        Process.sleep(50)
+        reader_loop(type, fd, spec, scale)
 
       :eof ->
-        # Buffer closed under us — Worker's :DOWN handler will restart.
         exit(:eof)
 
       {:error, reason} ->
-        Logger.warning("ex_qcom_smgr: reader read error: #{inspect(reason)}")
         exit({:read_error, reason})
-
-      {:ok, _short} ->
-        # Frame-size mismatch — backoff briefly, the kernel may
-        # have re-enabled with a different scan-elements set.
-        Process.sleep(50)
-        reader_loop(parent, fd, spec, scale)
     end
   end
 
-  # ---- IIO setup helpers ----
+  defp deliver(type, msg) do
+    case Process.whereis(name(type)) do
+      nil -> exit(:worker_gone)
+      pid -> send(pid, msg)
+    end
+  end
+
+  # ---- IIO buffer helpers ----
 
   defp enable_buffer(sysfs, type) do
+    # Scan elements and length can only be changed while the buffer is off.
+    disable_buffer(sysfs)
+
     Enum.each(ExQcomSmgr.scan_channels(type), fn chan ->
       _ = File.write(Path.join(sysfs, "scan_elements/#{chan}_en"), "1")
     end)
@@ -139,26 +196,20 @@ defmodule ExQcomSmgr.Worker do
     _ = File.write(Path.join(sysfs, "buffer/enable"), "1")
 
     case File.read(Path.join(sysfs, "buffer/enable")) do
-      {:ok, "1\n"} -> :ok
-      other -> {:error, {:buffer_enable_failed, other}}
-    end
-  end
-
-  defp read_scale(sysfs, type) do
-    case File.read(Path.join(sysfs, ExQcomSmgr.scale_attr(type))) do
       {:ok, content} ->
-        case Float.parse(String.trim(content)) do
-          {f, _} -> {:ok, f}
-          :error -> {:ok, 1.0}
-        end
+        if String.trim(content) == "1",
+          do: :ok,
+          else: {:error, {:buffer_enable_failed, content}}
 
-      _ ->
-        {:ok, 1.0}
+      other ->
+        {:error, {:buffer_enable_failed, other}}
     end
   end
 
-  defp open_chardev(sysfs) do
-    index = sysfs |> Path.basename() |> String.replace_prefix("iio:device", "")
-    File.open(Path.join("/dev", "iio:device" <> index), [:read, :raw, :binary])
+  defp disable_buffer(nil), do: :ok
+
+  defp disable_buffer(sysfs) do
+    _ = File.write(Path.join(sysfs, "buffer/enable"), "0")
+    :ok
   end
 end
