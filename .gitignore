@@ -3,6 +3,7 @@
 /cover/
 /deps/
 /doc/
+/tmp/
 /.fetch
 
 # Erlang

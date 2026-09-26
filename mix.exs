@@ -7,7 +7,8 @@ defmodule ExQcomSmgr.MixProject do
       version: "0.1.0",
       elixir: "~> 1.17",
       start_permanent: Mix.env() == :prod,
-      deps: deps()
+      deps: deps(),
+      aliases: aliases()
     ]
   end
 
@@ -20,8 +21,17 @@ defmodule ExQcomSmgr.MixProject do
 
   defp deps do
     [
-      # ADSP needs to be running before qcom-smgr IIO devices exist.
+      # Ordering-only dependency: no ExRemoteproc functions are called.
+      # Listing it makes OTP start :ex_remoteproc (which boots the ADSP)
+      # before this app; the qcom-smgr IIO devices only appear once the
+      # ADSP is running.
       {:ex_remoteproc, github: "mlainez/ex_remoteproc"}
     ]
+  end
+
+  # Tests run on the host: don't start this app (or ex_remoteproc),
+  # which would poke at /sys and /dev.
+  defp aliases do
+    [test: "test --no-start"]
   end
 end

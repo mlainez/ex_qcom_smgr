@@ -1,0 +1,3 @@
+%{
+  "ex_remoteproc": {:git, "https://github.com/mlainez/ex_remoteproc.git", "fd09c82b3cb49b9385c285c9f82944cf508b8a75", []},
+}
