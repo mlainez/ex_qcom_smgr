@@ -1,9 +1,5 @@
 # ex_qcom_smgr
 
-> ### ⚠️ Very early work — built for a workshop, not for production
->
-> Written for the **Goatmire Elixir workshop** on running Nerves on Fairphone 3 hardware. There are no stability guarantees and APIs will change without notice.
-
 Read Fairphone 3+ IIO sensors (accelerometer, gyroscope, magnetometer,
 proximity) from Elixir on Nerves.
 
